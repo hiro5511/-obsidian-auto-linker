@@ -1,0 +1,205 @@
+const { Plugin, Notice, Setting, TFile, PluginSettingTab } = require('obsidian');
+
+/** @typedef {{pattern: string, target: string, display: string}} Rule */
+/** @typedef {{dictPath: string, auto: boolean, saveOnly: boolean, dryRun: boolean}} AutoLinkerSettings */
+
+const DEFAULT_SETTINGS = {
+  dictPath: 'Meta/Link Dictionary.md',
+  auto: true,
+  saveOnly: true,
+  dryRun: false,
+};
+
+const TOKEN_PREFIX = '\uE000';
+const TOKEN_SUFFIX = '\uE001';
+
+/** 辞書テキストからルール配列を生成 */
+function parseDictionary(content) {
+  const rules = [];
+  const lines = content.split('\n');
+  for (const line of lines) {
+    if (!line.trim().startsWith('|')) continue;
+    const cells = line.split('|').map((c) => c.trim());
+    if (cells.length < 5) continue;
+    if (cells[1] === 'pattern') continue; // ヘッダ行
+    const pattern = cells[1];
+    const target = cells[2];
+    const display = cells[3] || '';
+    if (!pattern || !target) { console.warn('Auto Linker: invalid row', line); continue; }
+    if (!target.startsWith('[[') || !target.endsWith(']]')) { new Notice(`Auto Linker: targetが[[...]]形式ではありません (${target})`); continue; }
+    const cleanTarget = target.slice(2, -2).trim();
+    rules.push({ pattern, target: cleanTarget, display: display || pattern });
+  }
+  rules.sort((a, b) => b.pattern.length - a.pattern.length);
+  return rules;
+}
+
+/** 既存リンク/コードをマスク */
+function maskLinksAndCode(text, genToken) {
+  const map = new Map();
+  const mask = (regex) => {
+    text = text.replace(regex, (m) => { const token = genToken(); map.set(token, m); return token; });
+  };
+  mask(/```[\s\S]*?```/g);
+  mask(/`[^`\n]+`/g);
+  mask(/\[\[[\s\S]*?\]\]/g);
+  mask(/$begin:math:display$\\[[^$end:math:display$]+\]\]/g);
+  return { text, map };
+}
+
+/** マスクを復元 */
+function unmask(text, map) {
+  for (const [token, value] of map.entries()) { text = text.split(token).join(value); }
+  return text;
+}
+
+/** ルールに基づき置換 */
+function applyRules(text, rules, map, genToken) {
+  let count = 0;
+  const boundaryChar = "[^A-Za-z0-9\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]";
+  for (const rule of rules) {
+    const escaped = escapeRegExp(rule.pattern);
+    const regex = new RegExp(`(^|${boundaryChar})(${escaped})(?=$|${boundaryChar})`, 'g');
+    text = text.replace(regex, (m, pre) => {
+      count++;
+      const token = genToken();
+      map.set(token, buildLink(rule));
+      return pre + token;
+    });
+  }
+  return { text, count };
+}
+
+/** 本文変換処理 */
+function processContent(content, rules) {
+  let idx = 0;
+  const genToken = () => TOKEN_PREFIX + idx++ + TOKEN_SUFFIX;
+  const { text: masked, map } = maskLinksAndCode(content, genToken);
+  const { text: replaced, count } = applyRules(masked, rules, map, genToken);
+  const result = unmask(replaced, map);
+  return { result, count };
+}
+
+/** 置換後リンクを生成 */
+function buildLink(rule) {
+  if (rule.display && rule.display !== rule.pattern) return `[[${rule.target}|${rule.display}]]`;
+  return `[[${rule.target}]]`;
+}
+
+function escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+/** プラグイン本体 */
+class AutoLinkerPlugin extends Plugin {
+  async onload() {
+    console.log('Auto Linker: loading');
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.ignored = new Set();
+
+    this.addSettingTab(new AutoLinkerSettingTab(this.app, this));
+
+    this.addCommand({
+      id: 'auto-linker-convert-current',
+      name: '現在のファイルをリンク変換',
+      callback: async () => {
+        const file = this.app.workspace.getActiveFile();
+        if (file) await this.convertFile(file);
+        else new Notice('アクティブなファイルがありません');
+      },
+    });
+
+    this.registerEvent(this.app.vault.on('modify', (f) => this.onModify(f)));
+  }
+
+  onunload() { console.log('Auto Linker: unloaded'); }
+
+  async onModify(file) {
+    if (!this.settings.auto) return;
+    await this.convertFile(file);
+  }
+
+  async convertFile(file) {
+    try {
+      if (!(file instanceof TFile)) return;
+      if (file.extension !== 'md') return;
+      if (file.path.includes('/.trash/')) return;
+
+    // ★ 辞書ノートは処理しない
+    if (file.path === this.settings.dictPath || file.path.endsWith('/' + this.settings.dictPath)) return;
+
+      if (this.ignored.has(file.path)) return;
+
+      const rules = await this.loadDictionary();
+      if (!rules.length) return;
+
+      const original = await this.app.vault.read(file);
+      const { result, count } = processContent(original, rules);
+      if (result === original) { console.log('Auto Linker: no change', file.path); return; }
+
+      if (this.settings.dryRun) {
+        console.log('Auto Linker dry run', file.path, { before: original, after: result });
+        new Notice(`Auto Linker: 変換候補 ${count} 件（ドライラン）`);
+        return;
+      }
+
+      this.ignored.add(file.path);
+      await this.app.vault.modify(file, result);
+      setTimeout(() => this.ignored.delete(file.path), 1000);
+
+      new Notice(`Auto Linker: ${count} 件をリンク化`);
+    } catch (e) {
+      console.error('Auto Linker: convertFile error', e);
+    }
+  }
+
+  async loadDictionary() {
+    try {
+      const file = this.app.vault.getAbstractFileByPath(this.settings.dictPath);
+      if (!(file instanceof TFile)) { new Notice('Auto Linker: 辞書ノートが見つかりません'); return []; }
+      const content = await this.app.vault.read(file);
+      return parseDictionary(content);
+    } catch (e) {
+      new Notice('Auto Linker: 辞書読み込み失敗');
+      console.error('Auto Linker: loadDictionary error', e);
+      return [];
+    }
+  }
+
+  async saveSettings() { await this.saveData(this.settings); }
+}
+
+/** 設定タブ */
+class AutoLinkerSettingTab extends PluginSettingTab {
+  constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl('h2', { text: 'Auto Linker 設定' });
+
+    new Setting(containerEl)
+      .setName('辞書ノートパス')
+      .setDesc('Markdownテーブルで定義された辞書ノートへの相対パス')
+      .addText((text) =>
+        text.setPlaceholder('Meta/Link Dictionary.md')
+            .setValue(this.plugin.settings.dictPath)
+            .onChange(async (v) => { this.plugin.settings.dictPath = v.trim(); await this.plugin.saveSettings(); })
+      );
+
+    new Setting(containerEl)
+      .setName('自動変換を有効化')
+      .addToggle((toggle) => toggle.setValue(this.plugin.settings.auto)
+        .onChange(async (v) => { this.plugin.settings.auto = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('保存時のみ自動変換')
+      .setDesc('OFFにすると将来リアルタイム変換予定（未実装）')
+      .addToggle((toggle) => toggle.setValue(this.plugin.settings.saveOnly)
+        .onChange(async (v) => { this.plugin.settings.saveOnly = v; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName('ドライラン（結果を保存しない）')
+      .addToggle((toggle) => toggle.setValue(this.plugin.settings.dryRun)
+        .onChange(async (v) => { this.plugin.settings.dryRun = v; await this.plugin.saveSettings(); }));
+  }
+}
+
+module.exports = AutoLinkerPlugin;
